@@ -1,0 +1,6 @@
+# Shell scripts MUST be LF: a CRLF shebang breaks with "bad interpreter: ...^M".
+*.sh text eol=lf
+# PowerShell is happy either way; CRLF is conventional on Windows.
+*.ps1 text eol=crlf
+# Everything else: normalise to LF in the repo.
+* text=auto eol=lf
