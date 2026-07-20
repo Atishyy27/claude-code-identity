@@ -22,6 +22,7 @@ _cc_sourced=0
 if [ -n "$ZSH_VERSION" ]; then
     case $ZSH_EVAL_CONTEXT in *file*) _cc_sourced=1 ;; esac
 elif [ -n "$BASH_VERSION" ]; then
+    # shellcheck disable=SC3028  # only reached when running under bash
     [ "${BASH_SOURCE-}" != "$0" ] && _cc_sourced=1
 else
     case "${0##*/}" in cc.sh) _cc_sourced=0 ;; *) _cc_sourced=1 ;; esac
@@ -313,7 +314,9 @@ cc() {
 
     lock=$(_cc_lockfile "$dir")
     printf '%s\n' "$$" > "$lock"
-    # Drop the lock however we exit, including Ctrl-C.
+    # Drop the lock however we exit, including Ctrl-C. Single quotes are
+    # deliberate: $lock must be expanded when the trap fires, not now.
+    # shellcheck disable=SC2016
     trap 'rm -f "$lock"' INT TERM
 
     printf 'cc: claude as [%s]  (config: %s)\n' "$id" "$dir"

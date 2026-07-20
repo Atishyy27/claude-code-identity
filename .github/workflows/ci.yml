@@ -49,6 +49,10 @@ jobs:
         shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $issues = Invoke-ScriptAnalyzer -Path cc.ps1, install.ps1 -Severity Error, Warning
-          $issues | Format-Table -AutoSize
-          if ($issues | Where-Object Severity -eq 'Error') { exit 1 }
+          # -Path takes a single path, so analyse each file separately.
+          $issues = @()
+          foreach ($f in @('cc.ps1', 'install.ps1')) {
+            $issues += Invoke-ScriptAnalyzer -Path $f -Severity Error, Warning
+          }
+          if ($issues) { $issues | Format-Table -AutoSize } else { 'no findings' }
+          if ($issues | Where-Object { $_.Severity -eq 'Error' }) { exit 1 }
