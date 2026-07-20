@@ -17,10 +17,19 @@ echo "installed: $DEST"
 
 # Pick the rc file for the user's login shell.
 case "${SHELL##*/}" in
-    zsh)  RC="$HOME/.zshrc" ;;
-    bash) if [ -f "$HOME/.bashrc" ]; then RC="$HOME/.bashrc"; else RC="$HOME/.bash_profile"; fi ;;
-    *)    RC="$HOME/.profile" ;;
+    zsh) RC="$HOME/.zshrc" ;;
+    # Always .bashrc, creating it if absent: on Linux, interactive terminals
+    # start NON-login shells, which read .bashrc and never .bash_profile.
+    bash) RC="$HOME/.bashrc" ;;
+    sh|dash|ksh) RC="$HOME/.profile" ;;
+    *)
+        echo "install: ${SHELL##*/} is not a supported shell." >&2
+        echo "         cc.sh is POSIX sh and cannot be sourced by fish." >&2
+        echo "         Installed to $DEST, but no rc line was added." >&2
+        echo "         Run cc from bash or zsh instead." >&2
+        exit 0 ;;
 esac
+[ -f "$RC" ] || : > "$RC"
 
 if [ -f "$RC" ] && grep -Fq "$DEST" "$RC" 2>/dev/null; then
     echo "already sourced from: $RC"

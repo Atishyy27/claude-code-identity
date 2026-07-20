@@ -14,6 +14,26 @@
 # Identity is per-process: Claude Code reads CLAUDE_CONFIG_DIR once at launch,
 # so a running session can never change account. Use `cc <id> --resume`.
 
+# This file defines shell functions, so it must be SOURCED. Executing it would
+# define them in a subshell that exits immediately - silently doing nothing.
+# Note zsh sets $0 to the file when sourcing (unlike bash), so $0 alone is not
+# a reliable test; use each shell's own signal.
+_cc_sourced=0
+if [ -n "$ZSH_VERSION" ]; then
+    case $ZSH_EVAL_CONTEXT in *file*) _cc_sourced=1 ;; esac
+elif [ -n "$BASH_VERSION" ]; then
+    [ "${BASH_SOURCE-}" != "$0" ] && _cc_sourced=1
+else
+    case "${0##*/}" in cc.sh) _cc_sourced=0 ;; *) _cc_sourced=1 ;; esac
+fi
+if [ "$_cc_sourced" -eq 0 ]; then
+    printf 'cc: this script must be SOURCED, not executed.\n' >&2
+    printf '    Run:  . "%s"\n' "$0" >&2
+    printf '    (or add that line to your ~/.zshrc / ~/.bashrc - see install.sh)\n' >&2
+    exit 64
+fi
+unset _cc_sourced
+
 CC_HOME="${CC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/cc}"
 CC_IDENTITIES="$CC_HOME/identities"
 CC_DEFAULT="$CC_HOME/default"
@@ -54,7 +74,23 @@ _cc_link_shared() {
     dir="$1"
     [ "$dir" = "$CC_SHARED_ROOT" ] && return 0   # the primary IS the store
 
-    for sub in $CC_SHARED_DIRS; do
+    # Never create the store root itself. If it sits on a removable or network
+    # volume that isn't mounted, creating it would fabricate an empty store on
+    # the mountpoint and link every identity into it - which looks exactly like
+    # the tool ate your history, and shadows the real store once remounted.
+    if [ ! -d "$CC_SHARED_ROOT" ]; then
+        printf 'cc: shared store %s does not exist.\n' "$CC_SHARED_ROOT" >&2
+        printf '    If it lives on a removable or network volume, mount it and retry.\n' >&2
+        printf '    To create it deliberately: mkdir -p "%s"\n' "$CC_SHARED_ROOT" >&2
+        return 1
+    fi
+
+    # zsh does NOT word-split unquoted expansions (no SH_WORD_SPLIT by default),
+    # so `for sub in $CC_SHARED_DIRS` would iterate ONCE over the whole string
+    # on macOS's default shell. eval+set re-parses as command words, which
+    # splits identically in every shell.
+    eval "set -- $CC_SHARED_DIRS"
+    for sub in "$@"; do
         target="$CC_SHARED_ROOT/$sub"
         link="$dir/$sub"
         [ -d "$target" ] || mkdir -p "$target"
@@ -63,11 +99,16 @@ _cc_link_shared() {
             continue                              # already linked
         elif [ ! -e "$link" ]; then
             ln -s "$target" "$link" 2>/dev/null
-            # Some filesystems (and Git Bash without winsymlinks) silently copy
-            # instead of linking. Catch that here rather than re-merging forever.
+            # Some filesystems (and Git Bash without winsymlinks) silently COPY
+            # the whole target instead of linking. Remove the copy before
+            # erroring, or the next run sees a real dir full of the store's
+            # files and wedges on "collision" forever.
             if [ ! -L "$link" ]; then
+                [ -e "$link" ] && rm -rf "$link"
                 printf 'cc: could not create a symlink at %s\n' "$link" >&2
                 printf '    this filesystem does not appear to support symlinks.\n' >&2
+                printf '    On Git Bash, use PowerShell (install.ps1) instead, or set\n' >&2
+                printf '    MSYS=winsymlinks:nativestrict before starting the shell.\n' >&2
                 return 1
             fi
         elif [ -d "$link" ]; then
@@ -76,7 +117,10 @@ _cc_link_shared() {
                 '[ -e "$1/$(basename "$2")" ] && basename "$2"' _ "$target" {} \; 2>/dev/null)
             if [ -n "$collisions" ]; then
                 printf 'cc: refusing to merge %s - these already exist in the shared store:\n' "$link" >&2
-                printf '  %s\n' $collisions >&2
+                # quoted + sed, not `printf '  %s\n' $collisions`: unquoted
+                # splitting would break a colliding name containing spaces
+                # across several bullet lines.
+                printf '%s\n' "$collisions" | sed 's/^/  /' >&2
                 printf 'cc: resolve by hand, then re-run.\n' >&2
                 return 1
             fi
@@ -86,7 +130,16 @@ _cc_link_shared() {
             fi
             bak="$link.premerge-$(date +%Y%m%d%H%M%S)"
             mv "$link" "$bak" || return 1
-            ln -s "$target" "$link"
+            ln -s "$target" "$link" 2>/dev/null
+            # Verify here too: without this the user is told "merged" while
+            # actually holding a divergent copy that never syncs.
+            if [ ! -L "$link" ]; then
+                [ -e "$link" ] && rm -rf "$link"
+                mv "$bak" "$link"            # restore rather than leave a fake
+                printf 'cc: could not create a symlink at %s - restored the original.\n' "$link" >&2
+                printf '    this filesystem does not appear to support symlinks.\n' >&2
+                return 1
+            fi
             printf 'cc: merged %s into the shared store (backup: %s)\n' "$sub" "$(basename "$bak")"
         fi
     done
@@ -123,11 +176,26 @@ ccnew() {
     if [ -z "$id" ]; then
         printf 'usage: ccnew <id> [config-dir]\n' >&2; return 1
     fi
+    # The registry is whitespace-delimited ("id dir" per line), so an id with a
+    # space silently corrupts it: the identity can never be looked up or removed
+    # by its own name again.
+    case "$id" in
+        *[[:space:]]*)
+            printf 'cc: identity name cannot contain whitespace\n' >&2; return 1 ;;
+    esac
     if [ -n "$(_cc_dir "$id")" ]; then
         printf 'cc: identity [%s] already exists\n' "$id" >&2; return 1
     fi
     [ -n "$dir" ] || dir="$HOME/.claude-$id"
     case "$dir" in "~"*) dir="$HOME${dir#\~}" ;; esac
+    # Two identities pointing at one config dir defeat the session guard (both
+    # think they own it) and ccrm on either strips the other's links.
+    existing=$(awk -v d="$dir" '{ p=$0; sub(/^[^ ]+[ ]/,"",p); if (p == d) { print $1; exit } }' "$CC_IDENTITIES")
+    if [ -n "$existing" ]; then
+        printf 'cc: %s is already registered to [%s].\n' "$dir" "$existing" >&2
+        printf '    Two identities must not share a config directory.\n' >&2
+        return 1
+    fi
     mkdir -p "$dir" || return 1
     printf '%s %s\n' "$id" "$dir" >> "$CC_IDENTITIES"
     printf 'cc: registered [%s] -> %s\n' "$id" "$dir"
@@ -143,15 +211,29 @@ ccrm() {
     # Unlink the shared dirs FIRST. Deleting a symlink with `rm -r` would be
     # fine, but a user reaching for `rm -rf $dir` later would follow the links
     # and destroy the shared store, so we always leave the dir link-free.
-    for sub in $CC_SHARED_DIRS; do
+    eval "set -- $CC_SHARED_DIRS"          # see _cc_link_shared: zsh won't split
+    for sub in "$@"; do
         [ -L "$dir/$sub" ] && rm -f "$dir/$sub"
     done
-    grep -v "^$id " "$CC_IDENTITIES" > "$CC_IDENTITIES.tmp" 2>/dev/null &&
-        mv "$CC_IDENTITIES.tmp" "$CC_IDENTITIES"
+    # Filter with awk on an exact STRING match, not a grep regex: an id
+    # containing regex metacharacters (e.g. "a.b") would otherwise also match
+    # and silently delete unrelated identities (e.g. "axb"). awk also lets an
+    # empty result be a legitimate success - grep -v exits 1 when it filters
+    # every line, which previously skipped the write entirely.
+    awk -v want="$id" '$1 != want' "$CC_IDENTITIES" > "$CC_IDENTITIES.tmp" || true
+    mv "$CC_IDENTITIES.tmp" "$CC_IDENTITIES"
     [ "$(_cc_default_id)" = "$id" ] && : > "$CC_DEFAULT"
     printf 'cc: unregistered [%s]. Its config dir is left in place:\n' "$id"
     printf '    %s\n' "$dir"
-    printf '    Shared dirs were unlinked, so deleting it is now safe.\n'
+    if [ "${dir%/}" = "${CC_SHARED_ROOT%/}" ]; then
+        # For the primary, those dirs are the store itself - nothing was
+        # unlinked, and deleting it would destroy every identity's history.
+        printf 'cc: WARNING - this directory IS the shared store.\n' >&2
+        printf '    DO NOT DELETE IT. It holds the %s\n' "$CC_SHARED_DIRS" >&2
+        printf '    of every other identity. Move the store first if you need it gone.\n' >&2
+    else
+        printf '    Shared dirs were unlinked, so deleting it is now safe.\n'
+    fi
 }
 
 ccuse() {
@@ -236,11 +318,14 @@ cc() {
 
     printf 'cc: claude as [%s]  (config: %s)\n' "$id" "$dir"
     CLAUDE_CONFIG_DIR="$dir" claude "$@"
-    status=$?
+    # NOT `status`: that is a READ-ONLY special parameter in zsh. Assigning it
+    # aborts the function, so the lock below would never be removed and the
+    # next launch would see this shell's own PID and refuse forever.
+    _cc_status=$?
 
     rm -f "$lock"
     trap - INT TERM
-    return $status
+    return $_cc_status
 }
 
 # On shell startup, adopt the saved default so bare `claude` matches `cc`.

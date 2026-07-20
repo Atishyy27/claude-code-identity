@@ -58,12 +58,22 @@ function Connect-CcShared {
     param([Parameter(Mandatory)][string] $Dir)
     if ($Dir.TrimEnd('\') -eq $script:CcSharedRoot.TrimEnd('\')) { return $true }  # primary IS the store
 
+    # Never create the store root itself. If it sits on a removable or network
+    # volume that isn't mounted, creating it would fabricate an empty store and
+    # link every identity into it - which looks exactly like lost history.
+    if (-not (Test-Path -LiteralPath $script:CcSharedRoot)) {
+        Write-Host "cc: shared store $($script:CcSharedRoot) does not exist." -ForegroundColor Red
+        Write-Host "    If it lives on a removable or network volume, mount it and retry."
+        Write-Host "    To create it deliberately: mkdir `"$($script:CcSharedRoot)`""
+        return $false
+    }
+
     foreach ($sub in $script:CcSharedDirs) {
         $target = Join-Path $script:CcSharedRoot $sub
         $link   = Join-Path $Dir $sub
-        if (-not (Test-Path $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+        if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
 
-        $item = Get-Item $link -Force -ErrorAction SilentlyContinue
+        $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
         if ($null -eq $item) {
             New-Item -ItemType Junction -Path $link -Target $target | Out-Null
         }
@@ -73,8 +83,11 @@ function Connect-CcShared {
         else {
             # Real directory with content: merge, but never clobber. Collisions
             # are reported and refused rather than silently overwritten.
-            $collisions = Get-ChildItem $link -Force -ErrorAction SilentlyContinue |
-                Where-Object { Test-Path (Join-Path $target $_.Name) } |
+            # -LiteralPath is required: a name containing [ ] * or ? would
+            # otherwise be treated as a wildcard, and a false negative here
+            # means the merge silently overwrites the shared copy.
+            $collisions = Get-ChildItem -LiteralPath $link -Force -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $target $_.Name) } |
                 ForEach-Object { $_.Name }
             if ($collisions) {
                 Write-Host "cc: refusing to merge $link - these already exist in the shared store:" -ForegroundColor Red
@@ -107,10 +120,13 @@ function Test-CcLock {
     param([Parameter(Mandatory)][string] $Dir, [Parameter(Mandatory)][string] $Id)
     $lock = Join-Path $Dir '.cc-session.lock'
     if (-not (Test-Path $lock)) { return $true }
-    $pid = (Get-Content $lock -First 1 -ErrorAction SilentlyContinue)
-    if ($pid -notmatch '^\d+$') { Remove-Item $lock -Force -ErrorAction SilentlyContinue; return $true }
-    if (Get-Process -Id ([int]$pid) -ErrorAction SilentlyContinue) {
-        Write-Host "cc: WARNING - another Claude Code session (pid $pid) is already using" -ForegroundColor Yellow
+    # NOT $pid: that is a read-only PowerShell automatic variable, and variable
+    # names are case-insensitive. Assigning it errors, leaves the current
+    # shell's PID in place (always alive), and permanently blocks every launch.
+    $lockPid = (Get-Content $lock -First 1 -ErrorAction SilentlyContinue)
+    if ($lockPid -notmatch '^\d+$') { Remove-Item $lock -Force -ErrorAction SilentlyContinue; return $true }
+    if (Get-Process -Id ([int]$lockPid) -ErrorAction SilentlyContinue) {
+        Write-Host "cc: WARNING - another Claude Code session (pid $lockPid) is already using" -ForegroundColor Yellow
         Write-Host "    $Dir" -ForegroundColor Yellow
         Write-Host "    Concurrent sessions on one config dir can corrupt .claude.json" -ForegroundColor Yellow
         Write-Host "    (anthropics/claude-code#78439). Close it, or re-run with: cc -Force $Id" -ForegroundColor Yellow
@@ -126,6 +142,15 @@ function ccnew {
     Initialize-Cc
     if (Get-CcDir $Id) { Write-Host "cc: identity [$Id] already exists" -ForegroundColor Red; return }
     if (-not $Dir) { $Dir = Join-Path $env:USERPROFILE ".claude-$Id" }
+    # Two identities pointing at one config dir defeat the session guard (both
+    # think they own it) and ccrm on either strips the other's junctions.
+    foreach ($known in Get-CcIds) {
+        if ((Get-CcDir $known).TrimEnd('\') -eq $Dir.TrimEnd('\')) {
+            Write-Host "cc: $Dir is already registered to [$known]." -ForegroundColor Red
+            Write-Host "    Two identities must not share a config directory."
+            return
+        }
+    }
     if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Path $Dir -Force | Out-Null }
     Add-Content -Path $script:CcIdentities -Value "$Id $Dir"
     Write-Host "cc: registered [$Id] -> $Dir" -ForegroundColor Green
@@ -144,12 +169,31 @@ function ccrm {
         $item = Get-Item $link -Force -ErrorAction SilentlyContinue
         if ($item -and $item.LinkType) { [System.IO.Directory]::Delete($link, $false) }
     }
-    (Get-Content $script:CcIdentities) | Where-Object { $_ -notmatch "^\s*$([regex]::Escape($Id))\s+" } |
-        Set-Content $script:CcIdentities
-    if ((Get-CcDefaultId) -eq $Id) { Set-Content $script:CcDefault '' }
+    # Materialise first: piping an EMPTY result straight into Set-Content
+    # leaves the file untouched, silently keeping the last identity registered.
+    $kept = @(Get-Content $script:CcIdentities |
+        Where-Object { $_ -notmatch "^\s*$([regex]::Escape($Id))\s+" })
+    Set-Content -Path $script:CcIdentities -Value $kept
+
+    if ((Get-CcDefaultId) -eq $Id) {
+        Set-Content $script:CcDefault ''
+        # Also clear the persistent env var, or bare `claude` keeps pointing at
+        # an identity that is no longer registered.
+        [Environment]::SetEnvironmentVariable('CLAUDE_CONFIG_DIR', $null, 'User')
+        Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+    }
+
     Write-Host "cc: unregistered [$Id]. Its config dir is left in place:" -ForegroundColor Green
     Write-Host "    $dir"
-    Write-Host "    Junctions were removed, so deleting it is now safe."
+    if ($dir.TrimEnd('\') -eq $script:CcSharedRoot.TrimEnd('\')) {
+        # For the primary, those dirs are the store itself - nothing was
+        # removed, and deleting it would destroy every identity's history.
+        Write-Host "cc: WARNING - this directory IS the shared store." -ForegroundColor Red
+        Write-Host "    DO NOT DELETE IT. It holds the $($script:CcSharedDirs -join ', ')" -ForegroundColor Red
+        Write-Host "    of every other identity. Move the store first if you need it gone." -ForegroundColor Red
+    } else {
+        Write-Host "    Junctions were removed, so deleting it is now safe."
+    }
 }
 
 function ccuse {
@@ -196,14 +240,28 @@ function ccwho {
 }
 
 function cc {
-    param(
-        [Parameter(Position = 0)][string] $Id,
-        [switch] $Force,
-        # Required: without it PowerShell tries to bind pass-through flags like
-        # --resume as cc's own parameters and errors out.
-        [Parameter(ValueFromRemainingArguments = $true)][string[]] $Rest
-    )
+    # Deliberately NOT an advanced function, and deliberately no param() block.
+    # Declaring [Parameter()] attributes makes PowerShell add common parameters
+    # (-Verbose, -Debug, -PipelineVariable, ...), and short flags meant for
+    # claude then prefix-match them and get swallowed silently: `cc work -p
+    # "prompt"` would bind -p to -PipelineVariable and launch with NO args.
+    # Parsing $args by hand keeps every claude flag intact.
     Initialize-Cc
+    $argv  = @($args)
+    $Force = $false
+    if ($argv.Count -gt 0 -and @('-f', '--force', '-Force') -contains [string]$argv[0]) {
+        $Force = $true
+        $argv  = if ($argv.Count -gt 1) { @($argv[1..($argv.Count - 1)]) } else { @() }
+    }
+    # A leading token is an identity only if it isn't a flag; that way
+    # `cc --resume` resumes the DEFAULT identity instead of being read as an id.
+    $Id = $null
+    if ($argv.Count -gt 0 -and [string]$argv[0] -notlike '-*') {
+        $Id   = [string]$argv[0]
+        $argv = if ($argv.Count -gt 1) { @($argv[1..($argv.Count - 1)]) } else { @() }
+    }
+    $Rest = @($argv)
+
     if ($Id) {
         if (-not (Get-CcDir $Id)) {
             # A bare word that is not a known identity is almost always a typo.

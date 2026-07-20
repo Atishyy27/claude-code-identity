@@ -79,7 +79,19 @@ cc work --resume           # extra args pass straight through to claude
 ccrm work                  # unregister safely (unlinks first, see footgun below)
 ```
 
-The first identity you register pointing at `~/.claude` becomes the shared store; everything else links into it.
+The shared store is always `~/.claude` — the directory Claude Code already uses — regardless of what you register. Every other identity links into it. Registering `personal` at `~/.claude` is optional but recommended, so the store shows up in `ccwho`.
+
+**Environment overrides** (set them before sourcing `cc.sh`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CC_SHARED_ROOT` | `~/.claude` | Where the shared store lives |
+| `CC_HOME` | `~/.config/cc` | Where the identity registry lives |
+| `CC_SHARED_DIRS` | `projects skills agents commands` | Which directories are shared |
+
+**Requirements:** bash or zsh on macOS/Linux, or PowerShell on Windows. fish can't source a POSIX script, so it isn't supported. On Windows use `install.ps1` — Git Bash silently copies instead of creating symlinks, and `cc` will refuse rather than leave you with divergent copies (set `MSYS=winsymlinks:nativestrict` if you must use it).
+
+Note the force flag differs by platform: `cc -f <id>` in shell, `cc -Force <id>` in PowerShell.
 
 ## How it works
 

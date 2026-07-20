@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # cc.sh is sourced into an interactive shell, so it must behave under every
+  # shell we claim to support. zsh is the important one: it does not word-split
+  # unquoted expansions and has read-only special parameters, which broke this
+  # script on macOS in ways bash never surfaced.
+  shell:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          - os: ubuntu-latest
+            shell: dash
+          - os: macos-latest
+            shell: zsh
+          - os: macos-latest
+            shell: bash
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ${{ matrix.shell }}
+        run: |
+          if [ "${{ matrix.shell }}" = "dash" ]; then
+            sudo apt-get update && sudo apt-get install -y dash
+          fi
+      - name: Smoke tests under ${{ matrix.shell }}
+        run: ${{ matrix.shell }} tests/smoke.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -s sh cc.sh install.sh tests/smoke.sh
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path cc.ps1, install.ps1 -Severity Error, Warning
+          $issues | Format-Table -AutoSize
+          if ($issues | Where-Object Severity -eq 'Error') { exit 1 }
