@@ -21,11 +21,17 @@ cc: default identity -> [personal]
 
 There are a lot of Claude Code account switchers. [`claude-swap`](https://github.com/realiti4/claude-swap) is the most mature and has a TUI, a menu bar app and rate-limit-aware auto-switching — if you just want to switch accounts, use that. This tool exists for two things it doesn't do:
 
-**1. It refuses to let two sessions corrupt your config.**
+**1. It warns before two `cc`-launched sessions can corrupt your config.**
 
-Claude Code writes `~/.claude.json` non-atomically. Two processes on the same config directory can race, and one will overwrite a ~57 KB config with a ~50 byte stub — which looks exactly like being logged out (you're not; auth lives in a separate `.credentials.json`). Worse, the backup rotation keeps only five copies and counts the junk stubs, so a handful of bad launches silently evicts your last good backup.
+> **Scope, up front:** this guard only covers sessions started via `cc`. A bare `claude` bypasses it entirely — which is the tradeoff for `ccuse` making plain `claude` work at all. Treat it as a best-effort safety net, not a hard lock. See [Limits](#limits).
 
-This is one of the most repeatedly filed bugs against Claude Code — [#28824](https://github.com/anthropics/claude-code/issues/28824), [#28837](https://github.com/anthropics/claude-code/issues/28837), [#29143](https://github.com/anthropics/claude-code/issues/29143), [#40226](https://github.com/anthropics/claude-code/issues/40226), and [#78439](https://github.com/anthropics/claude-code/issues/78439) among others — and every other switcher sidesteps it by fully isolating each account. If you *want* accounts to share a store, that's not an option. So `cc` tracks a lock per config dir and stops you:
+Claude Code writes `~/.claude.json` non-atomically. Two processes on the same config directory can race, and one will overwrite a ~57 KB config with a ~50 byte stub — which looks exactly like being logged out (you're not; auth lives in a separate `.credentials.json`).
+
+That write race is well corroborated: [#28824](https://github.com/anthropics/claude-code/issues/28824), [#28837](https://github.com/anthropics/claude-code/issues/28837), [#29143](https://github.com/anthropics/claude-code/issues/29143) and [#40226](https://github.com/anthropics/claude-code/issues/40226) are independent third-party reports, all closed as duplicates of each other.
+
+A second, narrower concern is that the backup rotation now keeps only five copies and counts the junk stubs, so repeated bad launches can evict the last good backup. To be clear about the evidence: that specific eviction behaviour is described in exactly one issue, [#78439](https://github.com/anthropics/claude-code/issues/78439), which **I filed myself** and which is still open and unconfirmed by Anthropic. The four issues above predate the 5-slot cap and describe *unbounded* backup growth instead, so they do not corroborate it. Weigh it accordingly.
+
+Every other switcher sidesteps this class of problem by fully isolating each account. If you *want* accounts to share a store, that isn't an option — so `cc` tracks a lock per config dir and stops you:
 
 ```console
 $ cc work
@@ -87,7 +93,14 @@ Claude Code reads the `CLAUDE_CONFIG_DIR` environment variable to decide which c
 
 ## Limits
 
-- Only sessions launched through `cc` are lock-tracked. A bare `claude` bypasses the guard — that's the tradeoff for `ccuse` making plain `claude` work at all.
+The concurrency guard is a best-effort safety net. Known gaps, stated plainly:
+
+- **Bare `claude` bypasses it.** Only sessions launched through `cc` are lock-tracked. Since `ccuse` deliberately makes plain `claude` work, the common "three terminals, all typing `claude`" case is *not* covered. Closing this is the top item on the roadmap.
+- **Lock acquisition is not atomic.** The check and the lock write are separated by the symlink/merge step, so two `cc` runs started at nearly the same moment can both pass the check.
+- **The lock stores only a PID.** If a session dies uncleanly (SIGKILL, terminal force-closed, crash) the lock is left behind, and if that PID is later recycled to an unrelated process you'll get a false "session running" warning. Use `cc -f` / `cc -Force` to override.
+
+Other constraints:
+
 - Identity is per-process, so there's no mid-session switching. This is a Claude Code constraint, not something a wrapper can fix.
 - Windows uses junctions, which need no admin rights. macOS/Linux use symlinks. Both need a filesystem that supports them; `cc` errors out clearly if yours doesn't rather than silently copying.
 
