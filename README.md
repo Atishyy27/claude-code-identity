@@ -31,7 +31,7 @@ That write race is well corroborated: [#28824](https://github.com/anthropics/cla
 
 A second, narrower concern is that the backup rotation now keeps only five copies and counts the junk stubs, so repeated bad launches can evict the last good backup. To be clear about the evidence: that specific eviction behaviour is described in exactly one issue, [#78439](https://github.com/anthropics/claude-code/issues/78439), which **I filed myself** and which is still open and unconfirmed by Anthropic. The four issues above predate the 5-slot cap and describe *unbounded* backup growth instead, so they do not corroborate it. Weigh it accordingly.
 
-Every other switcher sidesteps this class of problem by fully isolating each account. If you *want* accounts to share a store, that isn't an option — so `cc` tracks a lock per config dir and stops you:
+Other tools handle this differently rather than not at all — `claude-swap`, for instance, cooperates with Claude Code's own lockfile protocol internally, which is arguably better engineering than a PID file. The difference here is that `cc` makes it **visible**: it stops, tells you which process holds the directory, and makes you decide, rather than resolving it silently.
 
 ```console
 $ cc work
