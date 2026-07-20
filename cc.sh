@@ -254,7 +254,7 @@ ccuse() {
     CLAUDE_CONFIG_DIR="$dir"; export CLAUDE_CONFIG_DIR
     printf 'cc: default identity -> [%s]\n' "$id"
     printf '    config: %s\n' "$dir"
-    printf '    this shell and all new ones: bare `claude` is now [%s].\n' "$id"
+    printf '    this shell and all new ones: bare claude is now [%s].\n' "$id"
     printf '    already-open shells keep their old identity until restarted.\n'
 }
 
